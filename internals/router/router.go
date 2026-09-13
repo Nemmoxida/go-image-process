@@ -16,7 +16,7 @@ func Router() *gin.Engine {
 	// send the image and image id to the client
 	r.GET("/images/:id")
 	// apply edit to the image
-	r.POST("/images/:id/transform")
+	r.POST("/images/transform", services.Transform)
 
 	return r
 
