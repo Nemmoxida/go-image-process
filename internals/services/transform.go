@@ -94,22 +94,5 @@ func Transform(c *gin.Context) {
 		return
 	}
 
-	// client, err := azblob.NewClientFromConnectionString(os.Getenv("CON_STRING"), nil)
-	// if err != nil {
-	// 	c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "could not connect to Azure Blob Storage"})
-	// 	return
-	// }
-
-	// blobName := RandStringBytes(15) + ".png"
-	// if _, err := client.UploadStream(context.Background(), os.Getenv("CON_NAME"), blobName, &afterImage, nil); err != nil {
-	// 	c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "could not upload resized image"})
-	// 	return
-	// }
-
-	// c.JSON(http.StatusOK, gin.H{
-	// 	"status": "success",
-	// 	"image":  "https://imageproject123.blob.core.windows.net/" + os.Getenv("CON_NAME") + "/" + blobName,
-	// })
-
 	c.DataFromReader(http.StatusOK, int64(afterImage.Len()), http.DetectContentType(afterImage.Bytes()), &afterImage, nil)
 }

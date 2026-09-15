@@ -12,7 +12,7 @@ func Router() *gin.Engine {
 	r.POST("/login", services.Login)
 	r.POST("/signup", services.Signup)
 	// image upload for edit
-	r.POST("/images", services.AddImage)
+	r.POST("/images/add", services.ApplyTransform)
 	// send the image and image id to the client
 	r.GET("/images/:id")
 	// apply edit to the image
