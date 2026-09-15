@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"office-expense-management-backend/pkg"
 	"os"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
@@ -41,26 +42,36 @@ type imageReq struct {
 	Filters *filtersType `json:"filters"`
 }
 
+type newImageReq struct {
+	Action   string   `json:"action" binding:"required"`
+	Metadata imageReq `json:"metadata" binding:"required"`
+}
+
+// add cache for image that hasn't been finalize (the edit)
+// user can do more than one edit (resize, cop, etc) but one at a time
+// add multiform respond (probably)
+
 func Transform(c *gin.Context) {
-	var request imageReq
+	var request newImageReq
 	if err := c.ShouldBindJSON(&request); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
 		return
 	}
 
-	if request.Resize.Width <= 0 || request.Resize.Height <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "resize width and height must be greater than zero"})
-		return
-	}
+	// check if rezie width is valid (more than 0)
+	// if request.Resize.Width <= 0 || request.Resize.Height <= 0 {
+	// 	c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "resize width and height must be greater than zero"})
+	// 	return
+	// }
 
-	parsedURL, err := url.Parse(request.URL)
+	parsedURL, err := url.Parse(request.Metadata.URL)
 	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "url must use http or https"})
 		return
 	}
 
 	// get image from cloud
-	response, err := http.Get(request.URL)
+	response, err := http.Get(request.Metadata.URL)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"status": "error", "message": "could not download image"})
 		return
@@ -72,65 +83,27 @@ func Transform(c *gin.Context) {
 		return
 	}
 
-	// if err := os.MkdirAll("images", 0755); err != nil {
-	// 	c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "could not create images directory"})
-	// 	return
-	// }
-
-	// baseName := filepath.Base(c.Param("id"))
-	// if baseName == "." || baseName == "" || baseName == string(filepath.Separator) {
-	// 	baseName = RandStringBytes(15)
-	// }
-	// baseName = strings.TrimSuffix(baseName, filepath.Ext(baseName))
-	// sourcePath := filepath.Join("images", baseName+".png")
-	// file, err := os.Create(sourcePath)
-	// if err != nil {
-	// 	c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "could not save downloaded image"})
-	// 	return
-	// }
-
-	// // save image to local
-	// _, copyErr := io.Copy(file, response.Body)
-	// closeErr := file.Close()
-	// if copyErr != nil || closeErr != nil {
-	// 	c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "could not save downloaded image"})
-	// 	return
-	// }
-
-	// open the image for processing
-	// img, err := imaging.Open(sourcePath)
-	// if err != nil {
-	// 	c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "downloaded file is not a supported image"})
-	// 	return
-	// }
-
 	img, err := imaging.Decode(response.Body)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "could not decode image"})
 		return
 	}
 
-	resized := imaging.Resize(img, request.Resize.Width, request.Resize.Height, imaging.Lanczos)
+	var afterImage bytes.Buffer
 
-	var resizedBuffer bytes.Buffer
-	var imageFormat imaging.Format
+	switch request.Action {
+	case "resize":
+		resized := pkg.Resize(img, request.Metadata.Resize.Width, request.Metadata.Resize.Height, request.Metadata.Ext)
 
-	switch request.Ext {
-	case "png":
-		imageFormat = imaging.PNG
-	case "jpeg", "jpg":
-		imageFormat = imaging.JPEG
+		if err := imaging.Encode(&afterImage, resized, imaging.PNG); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error encoding resized image"})
+			return
+		}
+
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "no valid action"})
+		return
 	}
-
-	if err := imaging.Encode(&resizedBuffer, resized, imageFormat); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": err})
-	}
-
-	// resizedPath := filepath.Join("images", baseName+"_resized.png")
-	// if err := imaging.Save(resized, resizedPath); err != nil {
-	// 	c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": fmt.Sprintf("could not save resized image: %v", err)})
-	// 	return
-	// }
 
 	client, err := azblob.NewClientFromConnectionString(os.Getenv("CON_STRING"), nil)
 	if err != nil {
@@ -138,15 +111,8 @@ func Transform(c *gin.Context) {
 		return
 	}
 
-	// resizedFile, err := os.Open(resizedPath)
-	// if err != nil {
-	// 	c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "could not open resized image"})
-	// 	return
-	// }
-	// defer resizedFile.Close()
-
 	blobName := RandStringBytes(15) + ".png"
-	if _, err := client.UploadStream(context.Background(), os.Getenv("CON_NAME"), blobName, &resizedBuffer, nil); err != nil {
+	if _, err := client.UploadStream(context.Background(), os.Getenv("CON_NAME"), blobName, &afterImage, nil); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "could not upload resized image"})
 		return
 	}
