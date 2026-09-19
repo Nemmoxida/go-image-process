@@ -34,8 +34,8 @@ type imageReq struct {
 	Ext     string       `json:"ext" binding:"required"`
 	Resize  *resizeType  `json:"resize" binding:"required"`
 	Crop    *cropType    `json:"crop"`
-	Rotate  *int         `json:"rotate"`
-	Format  *string      `json:"format"`
+	Rotate  *float64     `json:"rotate"`
+	Format  string       `json:"format"`
 	Filters *filtersType `json:"filters"`
 }
 
@@ -78,7 +78,13 @@ func Transform(c *gin.Context) {
 
 	switch payload.Action {
 	case "resize":
-		resized, err := pkg.Resize(img, payload.Metadata.Resize.Width, payload.Metadata.Resize.Height, payload.Metadata.Ext)
+
+		if payload.Metadata.Resize == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "no action data detected"})
+			return
+		}
+
+		resized, err := pkg.Resize(img, payload.Metadata.Resize.Width, payload.Metadata.Resize.Height)
 		if err != nil {
 			c.JSON(http.StatusBadGateway, gin.H{"status": "error", "message": err})
 			return
@@ -86,6 +92,79 @@ func Transform(c *gin.Context) {
 
 		if err := imaging.Encode(&afterImage, resized, imageFormat); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error encoding resized image"})
+			return
+		}
+
+	case "crop":
+
+		if payload.Metadata.Crop == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "no action data detected"})
+			return
+		}
+
+		crop, err := pkg.CropAt(img, payload.Metadata.Crop.X, payload.Metadata.Crop.Y, payload.Metadata.Crop.Width, payload.Metadata.Crop.Height)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": err})
+			return
+		}
+
+		if err := imaging.Encode(&afterImage, crop, imageFormat); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error encoding resized image"})
+			return
+		}
+
+	case "rotate":
+		if payload.Metadata.Rotate == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "no action data detected"})
+			return
+		}
+
+		rotate := pkg.Rotate(img, *payload.Metadata.Rotate)
+
+		if err := imaging.Encode(&afterImage, rotate, imageFormat); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error encoding resized image"})
+			return
+		}
+
+	case "changeFormat":
+
+		var imageFormatTo imaging.Format
+
+		switch payload.Metadata.Format {
+		case "png":
+			imageFormatTo = imaging.PNG
+		case "jpeg", "jpg":
+			imageFormatTo = imaging.JPEG
+		}
+
+		if err := imaging.Encode(&afterImage, img, imageFormatTo); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error encoding image"})
+			return
+		}
+
+	case "filters":
+		if payload.Metadata.Filters == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "no action data detected"})
+			return
+		}
+
+		filters := payload.Metadata.Filters
+		inverted := filters.Inverted != nil && *filters.Inverted
+		grayscale := filters.Grayscale != nil && *filters.Grayscale
+		flip := filters.Flip != nil && *filters.Flip
+		blur := 0
+		if filters.Blur != nil {
+			blur = *filters.Blur
+		}
+
+		filtered, err := pkg.Filters(img, inverted, grayscale, flip, blur)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
+			return
+		}
+
+		if err := imaging.Encode(&afterImage, filtered, imageFormat); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error encoding filtered image"})
 			return
 		}
 
