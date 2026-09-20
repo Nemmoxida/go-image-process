@@ -42,6 +42,7 @@ type imageReq struct {
 type newImageReq struct {
 	Action   string   `json:"action" binding:"required"`
 	Metadata imageReq `json:"metadata" binding:"required"`
+	UserId   string   `json:"userid"`
 }
 
 // add cache for image that hasn't been finalize (the edit)

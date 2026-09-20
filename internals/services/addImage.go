@@ -2,9 +2,11 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"math/rand/v2"
 	"net/http"
+	"office-expense-management-backend/database"
 	"os"
 	"path/filepath"
 
@@ -72,6 +74,29 @@ func AddImage(c *gin.Context) {
 			"message": "Error uploading image",
 		})
 		return
+	}
+
+	pool, err := database.Connect()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"errorInternalDatabase": err})
+		return
+	}
+
+	defer pool.Close()
+
+	a := c.PostForm("payload")
+
+	var payload newImageReq
+
+	if err := json.Unmarshal([]byte(a), &payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "reason": "invalid json format", "message": err})
+	}
+
+	if payload.UserId != "" {
+		_, err = pool.Exec(context.Background(),
+			"INSERT INTO edits (url, user) VALUES ($1, $2)",
+			"https://imageproject123.blob.core.windows.net/images/"+token,
+			payload.UserId)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "File has been saved", "metadata": gin.H{
