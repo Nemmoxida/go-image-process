@@ -3,7 +3,7 @@ package services
 import (
 	"context"
 	"net/http"
-	"office-expense-management-backend/database"
+	"simple-image-processing-golang/database"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"

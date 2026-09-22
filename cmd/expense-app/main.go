@@ -1,7 +1,7 @@
 package main
 
 import (
-	"office-expense-management-backend/internals/router"
+	"simple-image-processing-golang/internals/router"
 
 	"github.com/joho/godotenv"
 )

@@ -1,7 +1,7 @@
 package router
 
 import (
-	"office-expense-management-backend/internals/services"
+	"simple-image-processing-golang/internals/services"
 
 	"github.com/gin-gonic/gin"
 )

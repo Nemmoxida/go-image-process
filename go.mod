@@ -1,4 +1,4 @@
-module office-expense-management-backend
+module simple-image-processing-golang
 
 go 1.26.5
 

@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"office-expense-management-backend/database"
 	"os"
+	"simple-image-processing-golang/database"
 	"time"
 
 	"github.com/gin-gonic/gin"

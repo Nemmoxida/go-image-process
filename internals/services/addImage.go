@@ -6,9 +6,9 @@ import (
 	"log"
 	"math/rand/v2"
 	"net/http"
-	"office-expense-management-backend/database"
 	"os"
 	"path/filepath"
+	"simple-image-processing-golang/database"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/gin-gonic/gin"

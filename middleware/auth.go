@@ -2,7 +2,7 @@ package middleware
 
 import (
 	"net/http"
-	"office-expense-management-backend/pkg"
+	"simple-image-processing-golang/pkg"
 
 	"github.com/gin-gonic/gin"
 )

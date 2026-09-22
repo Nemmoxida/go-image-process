@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
-	"office-expense-management-backend/pkg"
+	"simple-image-processing-golang/pkg"
 
 	"github.com/disintegration/imaging"
 	"github.com/gin-gonic/gin"
