@@ -53,19 +53,32 @@ curl -X POST http://localhost:3001/images/add \
 
 ### `POST /images/transform`
 
-Send two multipart fields:
+Send a `multipart/form-data` request with these fields:
 
-- `image`: the source image.
+- `image`: repeat this field once for each source image (up to 50).
 - `metadata`: JSON in the request format below.
 
 The batch request format below replaces the old single-action
 `{"action": "...", "metadata": {...}}` format.
 
 Every successful transform response is a ZIP archive named `results.zip`.
-Each generated image gets **one** edit, selected round-robin from `edits`, and
-that edit is applied to the original image. For example, two edits and 50
-results produce 25 images from each edit. Random ranges are sampled separately
-for every result. Outputs are named `image_001.png`, `image_002.png`, etc.
+For each source image, the endpoint creates `count` results. Each result gets
+**one** edit, selected round-robin from `edits`, and that edit is applied to
+that source image. For example, 2 inputs with `count: 50` produce 100 results.
+Random ranges are sampled separately for every result. Outputs are grouped by
+source in the ZIP, such as `image_01/result_001.png`.
+
+Limits:
+
+- Up to 50 source images per request.
+- `count` is 1–50 results per source image.
+- Up to 2,500 total generated images per request.
+- Each uploaded file must be no larger than 400 KiB and no wider or taller
+  than 500 pixels.
+- Generated images may be no wider or taller than 2,000 pixels.
+- The final ZIP archive is limited to 250 MiB.
+- The total multipart request body is limited to approximately 20 MiB plus
+  1 MiB for form data and metadata.
 
 ### Common request format
 
@@ -86,7 +99,7 @@ for every result. Outputs are named `image_001.png`, `image_002.png`, etc.
 }
 ```
 
-- `count`: required, 1–100.
+- `count`: required, 1–50 results for each uploaded image.
 - `ext`: required output format: `png`, `jpg`, or `jpeg`.
 - `edits`: required and non-empty. `count` must be at least the number of edits.
 - `flip`: optional additional vertical flip applied independently to each
@@ -250,6 +263,11 @@ Each result additionally has a 50% independent chance of vertical flipping.
 ```bash
 curl -X POST http://localhost:3001/images/transform \
   -F "image=@./image.png" \
+  -F "image=@./another-image.png" \
   -F 'metadata={"count":10,"ext":"png","edits":[{"action":"randomScale","range":{"min":0.8,"max":1.2}},{"action":"saturation","range":{"min":-20,"max":20}}],"flip":{"enabled":true,"probability":0.25}}' \
   --output results.zip
 ```
+
+To request the maximum of 2,500 outputs, upload 50 images and set `"count": 50`.
+For example, uploading 10 source images with `"count": 50` generates 500
+results.

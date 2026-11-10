@@ -3,6 +3,7 @@ package services
 import (
 	"archive/zip"
 	"bytes"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -67,6 +68,108 @@ func TestTransformBatchDistributesEditsAndReturnsZip(t *testing.T) {
 	}
 	if dimensions[1] != 2 || dimensions[2] != 1 {
 		t.Fatalf("expected round-robin distribution of 2 resize and 1 random crop results, got dimensions %v", dimensions)
+	}
+}
+
+func TestTransformProcessesMultipleInputImages(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var firstImage, secondImage bytes.Buffer
+	if err := png.Encode(&firstImage, image.NewNRGBA(image.Rect(0, 0, 3, 3))); err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(&secondImage, image.NewNRGBA(image.Rect(0, 0, 4, 4))); err != nil {
+		t.Fatal(err)
+	}
+
+	body, contentType := transformMultipartImages(t, [][]byte{firstImage.Bytes(), secondImage.Bytes()},
+		`{"count":2,"ext":"png","edits":[{"action":"resize","resize":{"width":1,"height":1}}]}`)
+	request := httptest.NewRequest(http.MethodPost, "/images/transform", body)
+	request.Header.Set("Content-Type", contentType)
+	response := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(response)
+	context.Request = request
+
+	Transform(context)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", response.Code, response.Body.String())
+	}
+	archive, err := zip.NewReader(bytes.NewReader(response.Body.Bytes()), int64(response.Body.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archive.File) != 4 {
+		t.Fatalf("expected 4 archive entries, got %d", len(archive.File))
+	}
+	if archive.File[0].Name != "image_01/result_001.png" ||
+		archive.File[1].Name != "image_01/result_002.png" ||
+		archive.File[2].Name != "image_02/result_001.png" ||
+		archive.File[3].Name != "image_02/result_002.png" {
+		t.Fatalf("unexpected archive entry names: %q, %q, %q, %q",
+			archive.File[0].Name, archive.File[1].Name, archive.File[2].Name, archive.File[3].Name)
+	}
+}
+
+func TestTransformRejectsMoreThanFiftyInputs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var source bytes.Buffer
+	if err := png.Encode(&source, image.NewNRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	inputs := make([][]byte, maxTransformInputImages+1)
+	for i := range inputs {
+		inputs[i] = source.Bytes()
+	}
+	body, contentType := transformMultipartImages(t, inputs,
+		`{"count":1,"ext":"png","edits":[{"action":"rotate","range":{"min":0,"max":0}}]}`)
+	request := httptest.NewRequest(http.MethodPost, "/images/transform", body)
+	request.Header.Set("Content-Type", contentType)
+	response := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(response)
+	context.Request = request
+
+	Transform(context)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestTransformRejectsOversizedInputImage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body, contentType := transformMultipartImages(t, [][]byte{bytes.Repeat([]byte{0}, maxImageFileSize+1)},
+		`{"count":1,"ext":"png","edits":[{"action":"rotate","range":{"min":0,"max":0}}]}`)
+	request := httptest.NewRequest(http.MethodPost, "/images/transform", body)
+	request.Header.Set("Content-Type", contentType)
+	response := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(response)
+	context.Request = request
+
+	Transform(context)
+
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestTransformRejectsImageDimensionsOver500(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var source bytes.Buffer
+	if err := png.Encode(&source, image.NewNRGBA(image.Rect(0, 0, maxImageDimension+1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	body, contentType := transformMultipartImages(t, [][]byte{source.Bytes()},
+		`{"count":1,"ext":"png","edits":[{"action":"rotate","range":{"min":0,"max":0}}]}`)
+	request := httptest.NewRequest(http.MethodPost, "/images/transform", body)
+	request.Header.Set("Content-Type", contentType)
+	response := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(response)
+	context.Request = request
+
+	Transform(context)
+
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s", response.Code, response.Body.String())
 	}
 }
 
@@ -183,18 +286,24 @@ func TestLegacyFilterAndFixedCropActionsAreUnsupported(t *testing.T) {
 }
 
 func transformMultipart(t *testing.T, imageBytes []byte, metadata string) (*bytes.Buffer, string) {
+	return transformMultipartImages(t, [][]byte{imageBytes}, metadata)
+}
+
+func transformMultipartImages(t *testing.T, images [][]byte, metadata string) (*bytes.Buffer, string) {
 	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	if err := writer.WriteField("metadata", metadata); err != nil {
 		t.Fatal(err)
 	}
-	file, err := writer.CreateFormFile("image", "input.png")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.Copy(file, bytes.NewReader(imageBytes)); err != nil {
-		t.Fatal(err)
+	for i, imageBytes := range images {
+		file, err := writer.CreateFormFile("image", fmt.Sprintf("input_%02d.png", i+1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(file, bytes.NewReader(imageBytes)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)

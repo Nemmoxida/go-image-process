@@ -4,8 +4,10 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -17,7 +19,35 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const maxTransformResults = 100
+const (
+	maxTransformResultsPerImage = 50
+	maxTransformInputImages     = 50
+	maxTransformTotalResults    = 2500
+	maxImageFileSize            = 400 * 1024
+	maxImageDimension           = 500
+	maxGeneratedDimension       = maxImageDimension * 4
+	maxArchiveSize              = 250 * 1024 * 1024
+	maxMultipartOverhead        = 1024 * 1024
+	maxMultipartRequestSize     = maxTransformInputImages*maxImageFileSize + maxMultipartOverhead
+)
+
+var errArchiveTooLarge = errors.New("generated archive exceeds the 250 MiB limit")
+
+type boundedBuffer struct {
+	buffer bytes.Buffer
+	limit  int
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if len(p) > b.limit-b.buffer.Len() {
+		return 0, errArchiveTooLarge
+	}
+	return b.buffer.Write(p)
+}
+
+func (b *boundedBuffer) Bytes() []byte {
+	return b.buffer.Bytes()
+}
 
 type resizeType struct {
 	Width  int `json:"width"`
@@ -61,19 +91,30 @@ type newImageReq struct {
 }
 
 func Transform(c *gin.Context) {
-	metadata := c.PostForm("metadata")
-	fileHeader, err := c.FormFile("image")
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "reason": "no image found", "message": err.Error()})
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxMultipartRequestSize)
+	if err := c.Request.ParseMultipartForm(1 << 20); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"status": "error", "message": "multipart request exceeds the maximum request size"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "invalid multipart request"})
 		return
+	}
+	if c.Request.MultipartForm != nil {
+		defer c.Request.MultipartForm.RemoveAll()
 	}
 
-	file, err := fileHeader.Open()
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "reason": "could not open image", "message": err.Error()})
+	metadata := c.PostForm("metadata")
+	fileHeaders := c.Request.MultipartForm.File["image"]
+	if len(fileHeaders) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "reason": "no image found", "message": "provide at least one image field"})
 		return
 	}
-	defer file.Close()
+	if len(fileHeaders) > maxTransformInputImages {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": fmt.Sprintf("no more than %d input images are allowed", maxTransformInputImages)})
+		return
+	}
 
 	var request transformReq
 	if err := json.Unmarshal([]byte(metadata), &request); err != nil {
@@ -81,8 +122,13 @@ func Transform(c *gin.Context) {
 		return
 	}
 
-	if request.Count < 1 || request.Count > maxTransformResults {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": fmt.Sprintf("count must be between 1 and %d", maxTransformResults)})
+	if request.Count < 1 || request.Count > maxTransformResultsPerImage {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": fmt.Sprintf("count must be between 1 and %d per input image", maxTransformResultsPerImage)})
+		return
+	}
+	totalResults := len(fileHeaders) * request.Count
+	if totalResults > maxTransformTotalResults {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": fmt.Sprintf("total results cannot exceed %d", maxTransformTotalResults)})
 		return
 	}
 	if strings.TrimSpace(request.Ext) == "" {
@@ -113,39 +159,90 @@ func Transform(c *gin.Context) {
 		return
 	}
 
-	img, err := imaging.Decode(file)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "reason": "could not decode image", "message": err.Error()})
-		return
-	}
-
 	rng := rand.New(rand.NewSource(rand.Int63()))
-	var output bytes.Buffer
+	output := boundedBuffer{limit: maxArchiveSize}
 	archive := zip.NewWriter(&output)
-	for i := 0; i < request.Count; i++ {
-		edit := request.Edits[i%len(request.Edits)]
-		result, format, err := applyEdit(img, edit, outputFormat, rng)
-		if err != nil {
+	for imageIndex, fileHeader := range fileHeaders {
+		if fileHeader.Size > maxImageFileSize {
 			_ = archive.Close()
-			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"status": "error", "message": fmt.Sprintf("input image %d exceeds the 400 KiB file size limit", imageIndex+1)})
 			return
-		}
-		if request.Flip != nil && request.Flip.Enabled && rng.Float64() < *request.Flip.Probability {
-			result = imaging.FlipV(result)
 		}
 
-		name := fmt.Sprintf("image_%03d.%s", i+1, extensionForFormat(format))
-		writer, err := archive.Create(name)
-		if err == nil {
-			err = imaging.Encode(writer, result, format)
-		}
+		file, err := fileHeader.Open()
 		if err != nil {
 			_ = archive.Close()
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error encoding image"})
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": fmt.Sprintf("could not open input image %d", imageIndex+1)})
 			return
+		}
+		config, _, err := image.DecodeConfig(file)
+		if err == nil {
+			_, err = file.Seek(0, io.SeekStart)
+		}
+		if err != nil {
+			_ = file.Close()
+			_ = archive.Close()
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": fmt.Sprintf("could not read input image %d", imageIndex+1)})
+			return
+		}
+		if config.Width < 1 || config.Height < 1 || config.Width > maxImageDimension || config.Height > maxImageDimension {
+			_ = file.Close()
+			_ = archive.Close()
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"status": "error", "message": fmt.Sprintf("input image %d dimensions must not exceed 500x500 pixels", imageIndex+1)})
+			return
+		}
+		img, err := imaging.Decode(file)
+		closeErr := file.Close()
+		if err != nil {
+			_ = archive.Close()
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": fmt.Sprintf("could not decode input image %d", imageIndex+1)})
+			return
+		}
+		if closeErr != nil {
+			_ = archive.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": fmt.Sprintf("could not close input image %d", imageIndex+1)})
+			return
+		}
+
+		for resultIndex := 0; resultIndex < request.Count; resultIndex++ {
+			edit := request.Edits[resultIndex%len(request.Edits)]
+			result, format, err := applyEdit(img, edit, outputFormat, rng)
+			if err != nil {
+				_ = archive.Close()
+				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
+				return
+			}
+			bounds := result.Bounds()
+			if bounds.Dx() > maxGeneratedDimension || bounds.Dy() > maxGeneratedDimension {
+				_ = archive.Close()
+				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": fmt.Sprintf("transformed image dimensions cannot exceed %dx%d pixels", maxGeneratedDimension, maxGeneratedDimension)})
+				return
+			}
+			if request.Flip != nil && request.Flip.Enabled && rng.Float64() < *request.Flip.Probability {
+				result = imaging.FlipV(result)
+			}
+
+			name := fmt.Sprintf("image_%02d/result_%03d.%s", imageIndex+1, resultIndex+1, extensionForFormat(format))
+			writer, err := archive.Create(name)
+			if err == nil {
+				err = imaging.Encode(writer, result, format)
+			}
+			if err != nil {
+				_ = archive.Close()
+				if errors.Is(err, errArchiveTooLarge) {
+					c.JSON(http.StatusRequestEntityTooLarge, gin.H{"status": "error", "message": errArchiveTooLarge.Error()})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error encoding image"})
+				return
+			}
 		}
 	}
 	if err := archive.Close(); err != nil {
+		if errors.Is(err, errArchiveTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"status": "error", "message": errArchiveTooLarge.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error creating image archive"})
 		return
 	}
@@ -160,6 +257,9 @@ func validateEdit(edit editReq) error {
 		if edit.Resize == nil || edit.Resize.Width < 0 || edit.Resize.Height < 0 ||
 			(edit.Resize.Width == 0 && edit.Resize.Height == 0) {
 			return fmt.Errorf("resize requires non-negative width and height with at least one positive dimension")
+		}
+		if edit.Resize.Width > maxGeneratedDimension || edit.Resize.Height > maxGeneratedDimension {
+			return fmt.Errorf("resize dimensions cannot exceed %dx%d pixels", maxGeneratedDimension, maxGeneratedDimension)
 		}
 	case "randomCrop":
 		if edit.RandomCrop == nil {
