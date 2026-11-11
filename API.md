@@ -56,6 +56,9 @@ curl -X POST http://localhost:3001/images/add \
 Send a `multipart/form-data` request with these fields:
 
 - `image`: repeat this field once for each source image (up to 50).
+- `annotation`: optional YOLO `.txt` file for each image. If any annotations
+  are provided, every image must have exactly one annotation with the same
+  filename stem (for example, `image_1.png` and `image_1.txt`).
 - `metadata`: JSON in the request format below.
 
 The batch request format below replaces the old single-action
@@ -75,10 +78,19 @@ Limits:
 - Up to 2,500 total generated images per request.
 - Each uploaded file must be no larger than 400 KiB and no wider or taller
   than 500 pixels.
+- Each optional annotation must be a `.txt` file no larger than 400 KiB. Each
+  non-empty line must contain a non-negative class ID and normalized YOLO
+  `x_center y_center width height` values.
 - Generated images may be no wider or taller than 2,000 pixels.
 - The final ZIP archive is limited to 250 MiB.
-- The total multipart request body is limited to approximately 20 MiB plus
+- The total multipart request body is limited to approximately 40 MiB plus
   1 MiB for form data and metadata.
+
+When annotations are included, each generated image has a corresponding
+`result_NNN.txt` entry beside it in the ZIP archive. Resize and non-geometric
+edits preserve box coordinates; random crops clip boxes to the crop and remove
+boxes outside it; rotation produces axis-aligned bounding boxes; vertical
+flips update the vertical box position.
 
 ### Common request format
 
@@ -263,7 +275,9 @@ Each result additionally has a 50% independent chance of vertical flipping.
 ```bash
 curl -X POST http://localhost:3001/images/transform \
   -F "image=@./image.png" \
+  -F "annotation=@./image.txt" \
   -F "image=@./another-image.png" \
+  -F "annotation=@./another-image.txt" \
   -F 'metadata={"count":10,"ext":"png","edits":[{"action":"randomScale","range":{"min":0.8,"max":1.2}},{"action":"saturation","range":{"min":-20,"max":20}}],"flip":{"enabled":true,"probability":0.25}}' \
   --output results.zip
 ```

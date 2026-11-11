@@ -12,6 +12,8 @@ Blob Storage for uploaded images, and the `imaging` package for transformations.
   saturation, Gaussian blur and noise, random crop, random scale, and optional
   probabilistic vertical flip
 - Batch image generation with an even distribution across selected edit types
+- Optional YOLO annotation validation and synchronized updates for geometric
+  image transformations
 - PNG and JPEG format conversion
 
 ## Requirements

@@ -22,16 +22,21 @@ func Resize(img image.Image, width int, height int) (*image.NRGBA, error) {
 }
 
 func RandomCrop(img image.Image, widthFraction, heightFraction float64, rng *rand.Rand) (*image.NRGBA, error) {
+	cropped, _, err := RandomCropWithBounds(img, widthFraction, heightFraction, rng)
+	return cropped, err
+}
+
+func RandomCropWithBounds(img image.Image, widthFraction, heightFraction float64, rng *rand.Rand) (*image.NRGBA, image.Rectangle, error) {
 	if widthFraction <= 0 || widthFraction > 1 || heightFraction <= 0 || heightFraction > 1 {
-		return nil, errors.New("crop width and height fractions must be greater than 0 and at most 1")
+		return nil, image.Rectangle{}, errors.New("crop width and height fractions must be greater than 0 and at most 1")
 	}
 	if rng == nil {
-		return nil, errors.New("random source cannot be nil")
+		return nil, image.Rectangle{}, errors.New("random source cannot be nil")
 	}
 
 	bounds := img.Bounds()
 	if bounds.Dx() <= 0 || bounds.Dy() <= 0 {
-		return nil, errors.New("image dimensions must be greater than 0")
+		return nil, image.Rectangle{}, errors.New("image dimensions must be greater than 0")
 	}
 	width := int(math.Round(float64(bounds.Dx()) * widthFraction))
 	height := int(math.Round(float64(bounds.Dy()) * heightFraction))
@@ -39,8 +44,9 @@ func RandomCrop(img image.Image, widthFraction, heightFraction float64, rng *ran
 	height = max(1, min(height, bounds.Dy()))
 	x := bounds.Min.X + rng.Intn(bounds.Dx()-width+1)
 	y := bounds.Min.Y + rng.Intn(bounds.Dy()-height+1)
+	cropBounds := image.Rect(x, y, x+width, y+height)
 
-	return imaging.Crop(img, image.Rect(x, y, x+width, y+height)), nil
+	return imaging.Crop(img, cropBounds), cropBounds, nil
 }
 
 func Rotate(img image.Image, b float64) *image.NRGBA {

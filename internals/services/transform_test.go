@@ -8,6 +8,7 @@ import (
 	"image/color"
 	"image/png"
 	"io"
+	"math"
 	"math/rand"
 	"mime/multipart"
 	"net/http"
@@ -222,6 +223,120 @@ func TestTransformAppliesEnabledVerticalFlip(t *testing.T) {
 	}
 }
 
+func TestTransformIncludesAndUpdatesYOLOAnnotation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var source bytes.Buffer
+	if err := png.Encode(&source, image.NewNRGBA(image.Rect(0, 0, 3, 4))); err != nil {
+		t.Fatal(err)
+	}
+
+	body, contentType := transformMultipartWithAnnotation(t, "image_1.png", source.Bytes(), "image_1.txt", "0 0.5 0.25 0.5 0.5\n",
+		`{"count":1,"ext":"png","edits":[{"action":"resize","resize":{"width":6,"height":8}}],"flip":{"enabled":true,"probability":1}}`)
+	request := httptest.NewRequest(http.MethodPost, "/images/transform", body)
+	request.Header.Set("Content-Type", contentType)
+	response := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(response)
+	context.Request = request
+
+	Transform(context)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", response.Code, response.Body.String())
+	}
+	archive, err := zip.NewReader(bytes.NewReader(response.Body.Bytes()), int64(response.Body.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archive.File) != 2 || archive.File[1].Name != "image_01/result_001.txt" {
+		t.Fatalf("expected image and annotation entries, got %v", archiveNames(archive.File))
+	}
+	annotation, err := archive.File[1].Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := io.ReadAll(annotation)
+	closeErr := annotation.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if string(result) != "0 0.5 0.75 0.5 0.5\n" {
+		t.Fatalf("expected vertically flipped YOLO annotation, got %q", result)
+	}
+}
+
+func TestTransformRejectsInvalidAnnotations(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var source bytes.Buffer
+	if err := png.Encode(&source, image.NewNRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name           string
+		annotationName string
+		annotation     string
+	}{
+		{name: "non-text extension", annotationName: "image_1.png", annotation: "0 0.5 0.5 0.2 0.2"},
+		{name: "mismatched name", annotationName: "image_2.txt", annotation: "0 0.5 0.5 0.2 0.2"},
+		{name: "invalid YOLO row", annotationName: "image_1.txt", annotation: "not a yolo row"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body, contentType := transformMultipartWithAnnotation(t, "image_1.png", source.Bytes(), test.annotationName, test.annotation,
+				`{"count":1,"ext":"png","edits":[{"action":"rotate","range":{"min":0,"max":0}}]}`)
+			request := httptest.NewRequest(http.MethodPost, "/images/transform", body)
+			request.Header.Set("Content-Type", contentType)
+			response := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(response)
+			context.Request = request
+
+			Transform(context)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("expected status 400, got %d: %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestCropYOLOBoxesClipsAndRemovesOutsideBoxes(t *testing.T) {
+	boxes := []yoloBox{
+		{Class: 1, X: 0.5, Y: 0.5, Width: 0.6, Height: 0.6},
+		{Class: 2, X: 0.05, Y: 0.05, Width: 0.05, Height: 0.05},
+	}
+	result := cropYOLOBoxes(boxes, 100, 100, 25, 25, 50, 50)
+
+	if len(result) != 1 || result[0].Class != 1 ||
+		result[0].X != 0.5 || result[0].Y != 0.5 ||
+		result[0].Width != 1 || result[0].Height != 1 {
+		t.Fatalf("expected clipped crop annotation and removed outside box, got %+v", result)
+	}
+}
+
+func TestRotateYOLOBoxesTransformsCoordinatesAndDimensions(t *testing.T) {
+	result := rotateYOLOBoxes([]yoloBox{{Class: 3, X: 0.25, Y: 0.5, Width: 0.2, Height: 0.4}}, 100, 50, 50, 100, 90)
+
+	if len(result) != 1 || result[0].Class != 3 ||
+		math.Abs(result[0].X-0.5) > 1e-9 || math.Abs(result[0].Y-0.75) > 1e-9 ||
+		math.Abs(result[0].Width-0.4) > 1e-9 || math.Abs(result[0].Height-0.2) > 1e-9 {
+		t.Fatalf("expected rotated YOLO coordinates and dimensions, got %+v", result)
+	}
+}
+
+func TestReadMatchingAnnotationsRequiresOneForEveryImage(t *testing.T) {
+	images := []*multipart.FileHeader{
+		{Filename: "image_1.png"},
+		{Filename: "image_2.png"},
+	}
+	annotations := []*multipart.FileHeader{{Filename: "image_1.txt"}}
+
+	if _, err := readMatchingAnnotations(images, annotations); err == nil {
+		t.Fatal("expected an error when an uploaded image has no annotation")
+	}
+}
+
 func TestValidateEditRequiresBothRangeBounds(t *testing.T) {
 	if err := validateEdit(editReq{Action: "rotate", Range: &valueRange{}}); err == nil {
 		t.Fatal("expected an error when the range is missing bounds")
@@ -309,4 +424,39 @@ func transformMultipartImages(t *testing.T, images [][]byte, metadata string) (*
 		t.Fatal(err)
 	}
 	return &body, writer.FormDataContentType()
+}
+
+func transformMultipartWithAnnotation(t *testing.T, imageName string, imageBytes []byte, annotationName, annotation, metadata string) (*bytes.Buffer, string) {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("metadata", metadata); err != nil {
+		t.Fatal(err)
+	}
+	imageFile, err := writer.CreateFormFile("image", imageName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(imageFile, bytes.NewReader(imageBytes)); err != nil {
+		t.Fatal(err)
+	}
+	annotationFile, err := writer.CreateFormFile("annotation", annotationName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(annotationFile, annotation); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return &body, writer.FormDataContentType()
+}
+
+func archiveNames(files []*zip.File) []string {
+	names := make([]string, len(files))
+	for i, file := range files {
+		names[i] = file.Name
+	}
+	return names
 }

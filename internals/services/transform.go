@@ -10,7 +10,10 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"mime/multipart"
 	"net/http"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"simple-image-processing-golang/pkg"
@@ -24,11 +27,12 @@ const (
 	maxTransformInputImages     = 50
 	maxTransformTotalResults    = 2500
 	maxImageFileSize            = 400 * 1024
+	maxAnnotationFileSize       = 400 * 1024
 	maxImageDimension           = 500
 	maxGeneratedDimension       = maxImageDimension * 4
 	maxArchiveSize              = 250 * 1024 * 1024
 	maxMultipartOverhead        = 1024 * 1024
-	maxMultipartRequestSize     = maxTransformInputImages*maxImageFileSize + maxMultipartOverhead
+	maxMultipartRequestSize     = maxTransformInputImages*(maxImageFileSize+maxAnnotationFileSize) + maxMultipartOverhead
 )
 
 var errArchiveTooLarge = errors.New("generated archive exceeds the 250 MiB limit")
@@ -84,6 +88,14 @@ type transformReq struct {
 	Flip  *flipAugmentation `json:"flip"`
 }
 
+type yoloBox struct {
+	Class  int
+	X      float64
+	Y      float64
+	Width  float64
+	Height float64
+}
+
 type newImageReq struct {
 	Action   string          `json:"action"`
 	Metadata json.RawMessage `json:"metadata"`
@@ -113,6 +125,11 @@ func Transform(c *gin.Context) {
 	}
 	if len(fileHeaders) > maxTransformInputImages {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": fmt.Sprintf("no more than %d input images are allowed", maxTransformInputImages)})
+		return
+	}
+	annotationHeaders := c.Request.MultipartForm.File["annotation"]
+	if len(annotationHeaders) > 0 && len(annotationHeaders) != len(fileHeaders) {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "provide exactly one matching annotation for each image"})
 		return
 	}
 
@@ -157,6 +174,22 @@ func Transform(c *gin.Context) {
 	if err := validateFlip(request.Flip); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
 		return
+	}
+
+	annotations := make([][]yoloBox, len(fileHeaders))
+	if len(annotationHeaders) > 0 {
+		for _, header := range annotationHeaders {
+			if header.Size > maxAnnotationFileSize {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"status": "error", "message": "annotation exceeds the 400 KiB file size limit"})
+				return
+			}
+		}
+		var err error
+		annotations, err = readMatchingAnnotations(fileHeaders, annotationHeaders)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
+			return
+		}
 	}
 
 	rng := rand.New(rand.NewSource(rand.Int63()))
@@ -206,7 +239,14 @@ func Transform(c *gin.Context) {
 
 		for resultIndex := 0; resultIndex < request.Count; resultIndex++ {
 			edit := request.Edits[resultIndex%len(request.Edits)]
-			result, format, err := applyEdit(img, edit, outputFormat, rng)
+			var result image.Image
+			var format imaging.Format
+			var resultAnnotations []yoloBox
+			if len(annotationHeaders) > 0 {
+				result, format, resultAnnotations, err = applyEditWithAnnotations(img, edit, outputFormat, rng, annotations[imageIndex])
+			} else {
+				result, format, err = applyEdit(img, edit, outputFormat, rng)
+			}
 			if err != nil {
 				_ = archive.Close()
 				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
@@ -220,6 +260,7 @@ func Transform(c *gin.Context) {
 			}
 			if request.Flip != nil && request.Flip.Enabled && rng.Float64() < *request.Flip.Probability {
 				result = imaging.FlipV(result)
+				resultAnnotations = flipYoloBoxesVertically(resultAnnotations)
 			}
 
 			name := fmt.Sprintf("image_%02d/result_%03d.%s", imageIndex+1, resultIndex+1, extensionForFormat(format))
@@ -235,6 +276,27 @@ func Transform(c *gin.Context) {
 				}
 				c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error encoding image"})
 				return
+			}
+			if len(annotationHeaders) > 0 {
+				annotationWriter, err := archive.Create(fmt.Sprintf("image_%02d/result_%03d.txt", imageIndex+1, resultIndex+1))
+				if err != nil {
+					_ = archive.Close()
+					if errors.Is(err, errArchiveTooLarge) {
+						c.JSON(http.StatusRequestEntityTooLarge, gin.H{"status": "error", "message": errArchiveTooLarge.Error()})
+						return
+					}
+					c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error creating annotation archive entry"})
+					return
+				}
+				if err := writeYOLOAnnotations(annotationWriter, resultAnnotations); err != nil {
+					_ = archive.Close()
+					if errors.Is(err, errArchiveTooLarge) {
+						c.JSON(http.StatusRequestEntityTooLarge, gin.H{"status": "error", "message": errArchiveTooLarge.Error()})
+						return
+					}
+					c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "error writing annotation"})
+					return
+				}
 			}
 		}
 	}
@@ -297,6 +359,212 @@ func validateEdit(edit editReq) error {
 		}
 	default:
 		return fmt.Errorf("unsupported action %q", edit.Action)
+	}
+	return nil
+}
+
+func readMatchingAnnotations(imageHeaders, annotationHeaders []*multipart.FileHeader) ([][]yoloBox, error) {
+	imagesByName := make(map[string]int, len(imageHeaders))
+	for index, header := range imageHeaders {
+		name := filepath.Base(header.Filename)
+		extension := strings.ToLower(filepath.Ext(name))
+		if extension != ".jpg" && extension != ".jpeg" && extension != ".png" {
+			return nil, fmt.Errorf("image %q must use a .jpg, .jpeg, or .png extension when annotations are provided", name)
+		}
+		stem := strings.TrimSuffix(name, filepath.Ext(name))
+		if stem == "" {
+			return nil, fmt.Errorf("image %q must have a filename", name)
+		}
+		if _, exists := imagesByName[stem]; exists {
+			return nil, fmt.Errorf("image filename %q is duplicated", name)
+		}
+		imagesByName[stem] = index
+	}
+
+	annotations := make([][]yoloBox, len(imageHeaders))
+	seen := make(map[int]struct{}, len(annotationHeaders))
+	for _, header := range annotationHeaders {
+		name := filepath.Base(header.Filename)
+		if strings.ToLower(filepath.Ext(name)) != ".txt" {
+			return nil, fmt.Errorf("annotation %q must be a .txt file", name)
+		}
+		stem := strings.TrimSuffix(name, filepath.Ext(name))
+		imageIndex, exists := imagesByName[stem]
+		if !exists {
+			return nil, fmt.Errorf("annotation %q does not match an uploaded image filename", name)
+		}
+		if _, exists := seen[imageIndex]; exists {
+			return nil, fmt.Errorf("more than one annotation matches image %q", name)
+		}
+		seen[imageIndex] = struct{}{}
+		boxes, err := readYOLOAnnotation(header)
+		if err != nil {
+			return nil, fmt.Errorf("invalid annotation %q: %w", name, err)
+		}
+		annotations[imageIndex] = boxes
+	}
+	if len(seen) != len(imageHeaders) {
+		return nil, fmt.Errorf("each uploaded image must have one annotation with the same filename")
+	}
+	return annotations, nil
+}
+
+func readYOLOAnnotation(header *multipart.FileHeader) ([]yoloBox, error) {
+	if header.Size > maxAnnotationFileSize {
+		return nil, fmt.Errorf("annotation exceeds the 400 KiB file size limit")
+	}
+	file, err := header.Open()
+	if err != nil {
+		return nil, fmt.Errorf("could not open annotation: %w", err)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maxAnnotationFileSize+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("could not read annotation: %w", readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("could not close annotation: %w", closeErr)
+	}
+	if len(data) > maxAnnotationFileSize {
+		return nil, fmt.Errorf("annotation exceeds the 400 KiB file size limit")
+	}
+
+	boxes := make([]yoloBox, 0)
+	for lineNumber, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if len(fields) != 5 {
+			return nil, fmt.Errorf("line %d must contain a class id and four box values", lineNumber+1)
+		}
+		classID, err := strconv.Atoi(fields[0])
+		if err != nil || classID < 0 {
+			return nil, fmt.Errorf("line %d has an invalid class id", lineNumber+1)
+		}
+		values := [4]float64{}
+		for i, field := range fields[1:] {
+			value, err := strconv.ParseFloat(field, 64)
+			if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 1 {
+				return nil, fmt.Errorf("line %d has an invalid normalized box value", lineNumber+1)
+			}
+			values[i] = value
+		}
+		if values[2] == 0 || values[3] == 0 ||
+			values[0]-values[2]/2 < 0 || values[0]+values[2]/2 > 1 ||
+			values[1]-values[3]/2 < 0 || values[1]+values[3]/2 > 1 {
+			return nil, fmt.Errorf("line %d describes a box outside the image", lineNumber+1)
+		}
+		boxes = append(boxes, yoloBox{Class: classID, X: values[0], Y: values[1], Width: values[2], Height: values[3]})
+	}
+	return boxes, nil
+}
+
+func applyEditWithAnnotations(img image.Image, edit editReq, defaultFormat imaging.Format, rng *rand.Rand, boxes []yoloBox) (image.Image, imaging.Format, []yoloBox, error) {
+	switch edit.Action {
+	case "randomCrop":
+		bounds := img.Bounds()
+		widthFraction := sampleRange(edit.RandomCrop.Width, rng)
+		heightFraction := sampleRange(edit.RandomCrop.Height, rng)
+		result, crop, err := pkg.RandomCropWithBounds(img, widthFraction, heightFraction, rng)
+		if err != nil {
+			return nil, defaultFormat, nil, err
+		}
+		return result, defaultFormat, cropYOLOBoxes(boxes, bounds.Dx(), bounds.Dy(),
+			crop.Min.X-bounds.Min.X, crop.Min.Y-bounds.Min.Y, crop.Dx(), crop.Dy()), nil
+	case "rotate":
+		angle := sampleRange(edit.Range, rng)
+		result := pkg.Rotate(img, angle)
+		bounds := img.Bounds()
+		resultBounds := result.Bounds()
+		return result, defaultFormat, rotateYOLOBoxes(boxes, bounds.Dx(), bounds.Dy(), resultBounds.Dx(), resultBounds.Dy(), angle), nil
+	default:
+		result, format, err := applyEdit(img, edit, defaultFormat, rng)
+		return result, format, boxes, err
+	}
+}
+
+func cropYOLOBoxes(boxes []yoloBox, sourceWidth, sourceHeight, cropX, cropY, cropWidth, cropHeight int) []yoloBox {
+	transformed := make([]yoloBox, 0, len(boxes))
+	for _, box := range boxes {
+		left := box.X*float64(sourceWidth) - box.Width*float64(sourceWidth)/2 - float64(cropX)
+		right := box.X*float64(sourceWidth) + box.Width*float64(sourceWidth)/2 - float64(cropX)
+		top := box.Y*float64(sourceHeight) - box.Height*float64(sourceHeight)/2 - float64(cropY)
+		bottom := box.Y*float64(sourceHeight) + box.Height*float64(sourceHeight)/2 - float64(cropY)
+		left, right = max(0, left), min(float64(cropWidth), right)
+		top, bottom = max(0, top), min(float64(cropHeight), bottom)
+		if right <= left || bottom <= top {
+			continue
+		}
+		transformed = append(transformed, yoloBox{
+			Class:  box.Class,
+			X:      (left + right) / (2 * float64(cropWidth)),
+			Y:      (top + bottom) / (2 * float64(cropHeight)),
+			Width:  (right - left) / float64(cropWidth),
+			Height: (bottom - top) / float64(cropHeight),
+		})
+	}
+	return transformed
+}
+
+func rotateYOLOBoxes(boxes []yoloBox, sourceWidth, sourceHeight, outputWidth, outputHeight int, angle float64) []yoloBox {
+	radians := math.Pi * math.Mod(angle, 360) / 180
+	sin, cos := math.Sincos(radians)
+	transformed := make([]yoloBox, 0, len(boxes))
+	for _, box := range boxes {
+		centerX := box.X * float64(sourceWidth)
+		centerY := box.Y * float64(sourceHeight)
+		halfWidth := box.Width * float64(sourceWidth) / 2
+		halfHeight := box.Height * float64(sourceHeight) / 2
+		minX, minY := math.Inf(1), math.Inf(1)
+		maxX, maxY := math.Inf(-1), math.Inf(-1)
+		for _, corner := range [][2]float64{
+			{centerX - halfWidth, centerY - halfHeight},
+			{centerX + halfWidth, centerY - halfHeight},
+			{centerX - halfWidth, centerY + halfHeight},
+			{centerX + halfWidth, centerY + halfHeight},
+		} {
+			x := corner[0] - float64(sourceWidth)/2
+			y := corner[1] - float64(sourceHeight)/2
+			rotatedX := x*cos + y*sin + float64(outputWidth)/2
+			rotatedY := -x*sin + y*cos + float64(outputHeight)/2
+			minX, maxX = min(minX, rotatedX), max(maxX, rotatedX)
+			minY, maxY = min(minY, rotatedY), max(maxY, rotatedY)
+		}
+		minX, maxX = max(0, minX), min(float64(outputWidth), maxX)
+		minY, maxY = max(0, minY), min(float64(outputHeight), maxY)
+		if maxX <= minX || maxY <= minY {
+			continue
+		}
+		transformed = append(transformed, yoloBox{
+			Class:  box.Class,
+			X:      (minX + maxX) / (2 * float64(outputWidth)),
+			Y:      (minY + maxY) / (2 * float64(outputHeight)),
+			Width:  (maxX - minX) / float64(outputWidth),
+			Height: (maxY - minY) / float64(outputHeight),
+		})
+	}
+	return transformed
+}
+
+func flipYoloBoxesVertically(boxes []yoloBox) []yoloBox {
+	transformed := make([]yoloBox, len(boxes))
+	for i, box := range boxes {
+		box.Y = 1 - box.Y
+		transformed[i] = box
+	}
+	return transformed
+}
+
+func writeYOLOAnnotations(writer io.Writer, boxes []yoloBox) error {
+	for _, box := range boxes {
+		if _, err := fmt.Fprintf(writer, "%d %s %s %s %s\n", box.Class,
+			strconv.FormatFloat(box.X, 'f', -1, 64),
+			strconv.FormatFloat(box.Y, 'f', -1, 64),
+			strconv.FormatFloat(box.Width, 'f', -1, 64),
+			strconv.FormatFloat(box.Height, 'f', -1, 64)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
